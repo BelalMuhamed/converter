@@ -2,6 +2,7 @@
 using Microsoft.WindowsAPICodePack.Dialogs;
 using System.Data;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
@@ -23,10 +24,25 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
     }
-    public List<byte[]> FilesRecordContentInBytes { get; set; } = new List<byte[]>();
-    public List<string> FilesRecordContentInText { get; set; } = new List<string>();
-    string sharedPath, errorMsg = string.Empty;
-    DataTable cards;
+
+    private class FileConversionEntry
+    {
+        public string FilePath { get; set; }
+        public DataTable Table { get; set; }
+        public List<string> ParseErrors { get; set; } = new();
+    }
+
+    private class MdbCreationResult
+    {
+        public string FilePath { get; set; }
+        public string OutputPath { get; set; }
+        public int RowCount { get; set; }
+        public string Status { get; set; }
+        public string Detail { get; set; }
+    }
+
+    string sharedPath;
+    List<FileConversionEntry> fileEntries = new();
 
     #region Code-Behind for Moving Window
     private void TitleBar_MouseDown(object sender, MouseButtonEventArgs e)
@@ -63,15 +79,13 @@ public partial class MainWindow : Window
         string folderPath = dialog.SelectedPath;
         this.sharedPath = folderPath;
 
-        FilesRecordContentInBytes.Clear();
-        FilesRecordContentInText.Clear();
         ErrorLabel.Visibility = Visibility.Collapsed;
         LoadingBar.Visibility = Visibility.Visible;
         SuccessLabel.Visibility = Visibility.Collapsed;
         ErrorsListBox.ItemsSource = null;
         ErrorsListBox.Visibility = Visibility.Collapsed;
 
-        cards = new DataTable("Cards");
+        var newFileEntries = new List<FileConversionEntry>();
         var allErrors = new List<string>();
 
         await Task.Run(() =>
@@ -88,19 +102,9 @@ public partial class MainWindow : Window
                         continue;
                     }
 
-                    FilesRecordContentInBytes.AddRange(file.RecordsInBytes);
-                    FilesRecordContentInText.AddRange(file.RecordsInText);
-
                     var (table, errors) = FileHelper.ParseRecordsOfFileToDataTable(file.RecordsInText, file.RecordsInBytes, file.FilePath);
 
-                    foreach (DataColumn col in table.Columns)
-                    {
-                        if (!cards.Columns.Contains(col.ColumnName))
-                            cards.Columns.Add(col.ColumnName, col.DataType);
-                    }
-
-                    foreach (DataRow row in table.Rows)
-                        cards.ImportRow(row);
+                    newFileEntries.Add(new FileConversionEntry { FilePath = file.FilePath, Table = table, ParseErrors = errors });
 
                     allErrors.AddRange(errors);
                 }
@@ -110,6 +114,8 @@ public partial class MainWindow : Window
                 allErrors.Add($"Unexpected error: {ex.Message}");
             }
         });
+
+        fileEntries = newFileEntries;
 
         LoadingBar.Visibility = Visibility.Collapsed;
 
@@ -126,23 +132,25 @@ public partial class MainWindow : Window
         {
             LogTextBox.Clear(); // clear previous logs
 
-            foreach (DataRow row in cards.Rows)
+            foreach (var entry in fileEntries)
             {
-                StringBuilder sb = new StringBuilder();
-                foreach (DataColumn col in cards.Columns)
+                LogTextBox.AppendText($"=== {entry.FilePath} ({entry.Table.Rows.Count} rows) ==={Environment.NewLine}");
+
+                foreach (DataRow row in entry.Table.Rows)
                 {
-                    sb.Append($"{col.ColumnName}: {row[col]} | ");
-                }
-                sb.AppendLine("********************************************************");
-                // Append line to TextBox on UI thread
-                Dispatcher.Invoke(() =>
-                {
+                    StringBuilder sb = new StringBuilder();
+                    foreach (DataColumn col in entry.Table.Columns)
+                    {
+                        sb.Append($"{col.ColumnName}: {row[col]} | ");
+                    }
+                    sb.AppendLine("********************************************************");
                     LogTextBox.AppendText(sb.ToString() + Environment.NewLine);
-                });
+                }
             }
 
             SuccessLabel.Visibility = Visibility.Visible;
-            SelectedFileNameTextBlock.Text = $"Success! Records loaded: {FilesRecordContentInText.Count}";
+            int totalRecords = fileEntries.Sum(e => e.Table.Rows.Count);
+            SelectedFileNameTextBlock.Text = $"Success! Records loaded: {totalRecords}";
         }
 
 
@@ -150,7 +158,7 @@ public partial class MainWindow : Window
     private async void processButton_Click(object sender, RoutedEventArgs e)
     {
         // Validate that records are loaded
-        if (FilesRecordContentInText == null || FilesRecordContentInText.Count == 0)
+        if (fileEntries == null || fileEntries.Count == 0)
         {
             ErrorLabel.Content = "No records loaded. Please choose a folder first.";
             ErrorLabel.Visibility = Visibility.Visible;
@@ -163,54 +171,80 @@ public partial class MainWindow : Window
         SuccessLabel.Visibility = Visibility.Collapsed;
         LoadingBar.Visibility = Visibility.Visible;
 
-        string errorMsg = string.Empty;
+        var results = new List<MdbCreationResult>();
 
         await Task.Run(() =>
         {
-            try
+            var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var entry in fileEntries)
             {
-                // Convert loaded records to DataTable
-               
+                string baseName = System.IO.Path.GetFileNameWithoutExtension(entry.FilePath) + "_Output.mdb";
+                string outputName = baseName;
+                int suffix = 1;
+                while (!usedNames.Add(outputName))
+                {
+                    suffix++;
+                    outputName = System.IO.Path.GetFileNameWithoutExtension(entry.FilePath) + $"_Output_{suffix}.mdb";
+                }
 
-                // MDB path
-                string mdbPath = System.IO.Path.Combine(sharedPath, "CardsOutput.mdb");
+                string outputPath = System.IO.Path.Combine(sharedPath, outputName);
 
-               
+                if (entry.Table == null || entry.Table.Rows.Count == 0)
+                {
+                    results.Add(new MdbCreationResult { FilePath = entry.FilePath, Status = "Skipped", Detail = "0 valid records parsed" });
+                    continue;
+                }
 
-                // Create MDB file from DataTable
-                FileHelper.CreateMdbFromDataTable(cards, mdbPath);
-            }
-            catch (Exception ex)
-            {
-                errorMsg = ex.Message;
+                try
+                {
+                    FileHelper.CreateMdbFromDataTable(entry.Table, outputPath);
+                    results.Add(new MdbCreationResult { FilePath = entry.FilePath, OutputPath = outputPath, RowCount = entry.Table.Rows.Count, Status = "Created" });
+                }
+                catch (Exception ex)
+                {
+                    results.Add(new MdbCreationResult { FilePath = entry.FilePath, OutputPath = outputPath, Status = "Failed", Detail = ex.Message });
+                }
             }
         });
 
         LoadingBar.Visibility = Visibility.Collapsed;
 
-        if (!string.IsNullOrEmpty(errorMsg))
+        LogTextBox.Clear();
+        foreach (var result in results)
         {
-            ErrorLabel.Content = errorMsg;
-            ErrorLabel.Visibility = Visibility.Visible;
-            LogTextBox.Text = errorMsg;
+            string line = result.Status switch
+            {
+                "Created" => $"{result.FilePath} -> Created: {result.OutputPath} ({result.RowCount} records)",
+                "Skipped" => $"{result.FilePath} -> Skipped: {result.Detail}",
+                _ => $"{result.FilePath} -> Failed: {result.Detail}",
+            };
+            LogTextBox.AppendText(line + Environment.NewLine);
         }
-        else
+
+        int createdCount = results.Count(r => r.Status == "Created");
+        int skippedCount = results.Count(r => r.Status == "Skipped");
+        int failedCount = results.Count(r => r.Status == "Failed");
+
+        if (skippedCount + failedCount > 0)
+        {
+            ErrorLabel.Content = $"{failedCount} failed, {skippedCount} skipped out of {results.Count} files";
+            ErrorLabel.Visibility = Visibility.Visible;
+
+            ErrorsListBox.ItemsSource = results
+                .Where(r => r.Status != "Created")
+                .Select(r => $"File: {r.FilePath}\n{r.Status}: {r.Detail}")
+                .ToList();
+            ErrorsListBox.Visibility = Visibility.Visible;
+            FailedP3Panel.Visibility = Visibility.Visible;
+        }
+
+        if (createdCount > 0)
         {
             SuccessLabel.Visibility = Visibility.Visible;
-            SelectedFileNameTextBlock.Text = $"Success! MDB created at: {System.IO.Path.Combine(sharedPath, "CardsOutput.mdb")}";
-
-            // Show DataTable records in LogTextBox
-            LogTextBox.Clear();
-            foreach (DataRow row in cards.Rows)
-            {
-                StringBuilder sb = new StringBuilder();
-                foreach (DataColumn col in cards.Columns)
-                {
-                    sb.Append($"{col.ColumnName}: {row[col]} | ");
-                }
-                LogTextBox.AppendText(sb.ToString() + Environment.NewLine);
-            }
         }
+
+        SelectedFileNameTextBlock.Text = $"Created {createdCount} of {results.Count} mdb file(s) in {sharedPath}";
     }
 
 }
