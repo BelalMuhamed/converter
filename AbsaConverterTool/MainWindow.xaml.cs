@@ -28,14 +28,14 @@ public partial class MainWindow : Window
     private class FileConversionEntry
     {
         public string FilePath { get; set; }
-        public DataTable Table { get; set; }
-        public List<string> ParseErrors { get; set; } = new();
+        public FileParseResult ParseResult { get; set; }
     }
 
     private class MdbCreationResult
     {
         public string FilePath { get; set; }
         public string OutputPath { get; set; }
+        public string ProductDisplayName { get; set; }
         public int RowCount { get; set; }
         public string Status { get; set; }
         public string Detail { get; set; }
@@ -67,7 +67,7 @@ public partial class MainWindow : Window
     }
 
     #endregion
-    
+
     private async void ChooseFolder_Click(object sender, RoutedEventArgs e)
     {
         var dialog = new System.Windows.Forms.FolderBrowserDialog();
@@ -102,11 +102,15 @@ public partial class MainWindow : Window
                         continue;
                     }
 
-                    var (table, errors) = FileHelper.ParseRecordsOfFileToDataTable(file.RecordsInText, file.RecordsInBytes, file.FilePath);
+                    var parseResult = FileHelper.ParseFileRecords(file.RecordsInText, file.RecordsInBytes, file.FilePath);
 
-                    newFileEntries.Add(new FileConversionEntry { FilePath = file.FilePath, Table = table, ParseErrors = errors });
+                    newFileEntries.Add(new FileConversionEntry { FilePath = file.FilePath, ParseResult = parseResult });
 
-                    allErrors.AddRange(errors);
+                    // Only hard parse exceptions surface here, same as before. Records that fail
+                    // because of an unknown/missing product code or oversized chip data are not
+                    // exceptions - they are carried in ParseResult.FailedRecords for the Excel
+                    // report generated during "Process Files".
+                    allErrors.AddRange(parseResult.ParseErrors);
                 }
             }
             catch (Exception ex)
@@ -134,23 +138,36 @@ public partial class MainWindow : Window
 
             foreach (var entry in fileEntries)
             {
-                LogTextBox.AppendText($"=== {entry.FilePath} ({entry.Table.Rows.Count} rows) ==={Environment.NewLine}");
+                int failedCount = entry.ParseResult.FailedRecords.Count;
+                LogTextBox.AppendText($"=== {entry.FilePath} ({entry.ParseResult.Records.Count} valid record(s), {failedCount} failed record(s)) ==={Environment.NewLine}");
 
-                foreach (DataRow row in entry.Table.Rows)
+                foreach (var record in entry.ParseResult.Records)
                 {
+                    ProductMapping.TryGet(record.ProductCode, out var productInfo);
                     StringBuilder sb = new StringBuilder();
-                    foreach (DataColumn col in entry.Table.Columns)
-                    {
-                        sb.Append($"{col.ColumnName}: {row[col]} | ");
-                    }
+                    sb.Append($"Product: {productInfo?.DisplayName ?? record.ProductCode} ({record.ProductCode}) | ");
+                    sb.Append($"IDWAutoNumber: {record.RecordIndex} | ");
+                    sb.Append($"IDWPAN: {record.PAN} | ");
+                    sb.Append($"IDWEXP: {record.EXP} | ");
+                    sb.Append($"IDWNAME: {record.Name} | ");
+                    sb.Append($"IDWCVV2: {record.CVV2} | ");
+                    sb.Append($"IDWTrack1: {record.Track1} | ");
+                    sb.Append($"IDWTrack2: {record.Track2} | ");
+                    sb.Append($"IDWChip1: {record.Chip1} | ");
+                    sb.Append($"IDWChip2: {record.Chip2} | ");
+                    sb.Append($"IDWChip3: {record.Chip3} | ");
+                    sb.Append($"IDWChip4: {record.Chip4} | ");
                     sb.AppendLine("********************************************************");
                     LogTextBox.AppendText(sb.ToString() + Environment.NewLine);
                 }
             }
 
             SuccessLabel.Visibility = Visibility.Visible;
-            int totalRecords = fileEntries.Sum(e => e.Table.Rows.Count);
-            SelectedFileNameTextBlock.Text = $"Success! Records loaded: {totalRecords}";
+            int totalRecords = fileEntries.Sum(e => e.ParseResult.Records.Count);
+            int totalFailed = fileEntries.Sum(e => e.ParseResult.FailedRecords.Count);
+            SelectedFileNameTextBlock.Text = totalFailed > 0
+                ? $"Success! Valid records loaded: {totalRecords} ({totalFailed} will be reported as failed in Failures.xlsx)"
+                : $"Success! Records loaded: {totalRecords}";
         }
 
 
@@ -172,6 +189,8 @@ public partial class MainWindow : Window
         LoadingBar.Visibility = Visibility.Visible;
 
         var results = new List<MdbCreationResult>();
+        var allFailedRecords = new List<FailedRecord>();
+        string failuresReportPath = null;
 
         await Task.Run(() =>
         {
@@ -179,32 +198,70 @@ public partial class MainWindow : Window
 
             foreach (var entry in fileEntries)
             {
-                string baseName = System.IO.Path.GetFileNameWithoutExtension(entry.FilePath) + "_Output.mdb";
-                string outputName = baseName;
-                int suffix = 1;
-                while (!usedNames.Add(outputName))
-                {
-                    suffix++;
-                    outputName = System.IO.Path.GetFileNameWithoutExtension(entry.FilePath) + $"_Output_{suffix}.mdb";
-                }
+                allFailedRecords.AddRange(entry.ParseResult.FailedRecords);
 
-                string outputPath = System.IO.Path.Combine(sharedPath, outputName);
+                // One output .mdb per Product Code bucket found in this file. AGVQ (Signature
+                // Credit + Signature Debit) is a single bucket by construction, since both
+                // share the same ProductCode.
+                var groups = entry.ParseResult.Records
+                    .GroupBy(r => r.ProductCode)
+                    .ToList();
 
-                if (entry.Table == null || entry.Table.Rows.Count == 0)
+                if (groups.Count == 0)
                 {
                     results.Add(new MdbCreationResult { FilePath = entry.FilePath, Status = "Skipped", Detail = "0 valid records parsed" });
                     continue;
                 }
 
-                try
+                string baseName = System.IO.Path.GetFileNameWithoutExtension(entry.FilePath);
+
+                foreach (var group in groups)
                 {
-                    FileHelper.CreateMdbFromDataTable(entry.Table, outputPath);
-                    results.Add(new MdbCreationResult { FilePath = entry.FilePath, OutputPath = outputPath, RowCount = entry.Table.Rows.Count, Status = "Created" });
+                    ProductMapping.TryGet(group.Key, out var productInfo);
+                    string token = productInfo?.FileNameToken ?? group.Key;
+
+                    string outputName = $"{baseName}_{token}.mdb";
+                    int suffix = 1;
+                    while (!usedNames.Add(outputName))
+                    {
+                        suffix++;
+                        outputName = $"{baseName}_{token}_{suffix}.mdb";
+                    }
+
+                    string outputPath = System.IO.Path.Combine(sharedPath, outputName);
+                    var recordsForProduct = group.ToList();
+
+                    try
+                    {
+                        var table = FileHelper.BuildCardsDataTable(recordsForProduct);
+                        FileHelper.CreateMdbFromDataTable(table, outputPath);
+                        results.Add(new MdbCreationResult
+                        {
+                            FilePath = entry.FilePath,
+                            OutputPath = outputPath,
+                            ProductDisplayName = productInfo?.DisplayName ?? group.Key,
+                            RowCount = recordsForProduct.Count,
+                            Status = "Created"
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        results.Add(new MdbCreationResult
+                        {
+                            FilePath = entry.FilePath,
+                            OutputPath = outputPath,
+                            ProductDisplayName = productInfo?.DisplayName ?? group.Key,
+                            Status = "Failed",
+                            Detail = ex.Message
+                        });
+                    }
                 }
-                catch (Exception ex)
-                {
-                    results.Add(new MdbCreationResult { FilePath = entry.FilePath, OutputPath = outputPath, Status = "Failed", Detail = ex.Message });
-                }
+            }
+
+            if (allFailedRecords.Count > 0)
+            {
+                failuresReportPath = System.IO.Path.Combine(sharedPath, "Failures.xlsx");
+                FileHelper.WriteFailuresReport(allFailedRecords, failuresReportPath);
             }
         });
 
@@ -215,11 +272,16 @@ public partial class MainWindow : Window
         {
             string line = result.Status switch
             {
-                "Created" => $"{result.FilePath} -> Created: {result.OutputPath} ({result.RowCount} records)",
+                "Created" => $"{result.FilePath} -> Created: {result.OutputPath} [{result.ProductDisplayName}] ({result.RowCount} records)",
                 "Skipped" => $"{result.FilePath} -> Skipped: {result.Detail}",
                 _ => $"{result.FilePath} -> Failed: {result.Detail}",
             };
             LogTextBox.AppendText(line + Environment.NewLine);
+        }
+
+        if (allFailedRecords.Count > 0)
+        {
+            LogTextBox.AppendText(Environment.NewLine + $"{allFailedRecords.Count} record(s) failed validation -> see {failuresReportPath}" + Environment.NewLine);
         }
 
         int createdCount = results.Count(r => r.Status == "Created");
@@ -228,7 +290,7 @@ public partial class MainWindow : Window
 
         if (skippedCount + failedCount > 0)
         {
-            ErrorLabel.Content = $"{failedCount} failed, {skippedCount} skipped out of {results.Count} files";
+            ErrorLabel.Content = $"{failedCount} failed, {skippedCount} skipped out of {results.Count} output file(s)";
             ErrorLabel.Visibility = Visibility.Visible;
 
             ErrorsListBox.ItemsSource = results
@@ -244,7 +306,11 @@ public partial class MainWindow : Window
             SuccessLabel.Visibility = Visibility.Visible;
         }
 
-        SelectedFileNameTextBlock.Text = $"Created {createdCount} of {results.Count} mdb file(s) in {sharedPath}";
+        string failuresNote = allFailedRecords.Count > 0
+            ? $", {allFailedRecords.Count} record(s) failed (see Failures.xlsx)"
+            : string.Empty;
+
+        SelectedFileNameTextBlock.Text = $"Created {createdCount} of {results.Count} mdb file(s) in {sharedPath}{failuresNote}";
     }
 
 }

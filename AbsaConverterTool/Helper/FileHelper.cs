@@ -1,7 +1,8 @@
 ﻿using System.Data;
 using System.Data.OleDb;
 using System.IO;
-using ADOX; 
+using ADOX;
+using ClosedXML.Excel;
 
 using System.Text;
 
@@ -12,12 +13,127 @@ namespace AbsaConverterTool.Helper
         public string FilePath { get; set; }
         public List<byte[]> RecordsInBytes { get; set; } = new();
         public List<string> RecordsInText { get; set; } = new();
-        public string ErrorMessage { get; set; } = null; 
+        public string ErrorMessage { get; set; } = null;
     }
+
+    /// <summary>
+    /// One product entry from the confirmed mapping table. AGVQ is shared by
+    /// "Signature Credit" and "Signature Debit", so a single ProductInfo can carry
+    /// more than one display name while still resolving to one output bucket.
+    /// </summary>
+    public class ProductInfo
+    {
+        public string Code { get; set; }
+        public List<string> DisplayNames { get; } = new();
+
+        /// <summary>Human-readable name(s) for UI/log display, e.g. "Signature Credit + Signature Debit".</summary>
+        public string DisplayName => string.Join(" + ", DisplayNames);
+
+        /// <summary>Token used inside generated file names, e.g. "SignatureCredit_SignatureDebit".</summary>
+        public string FileNameToken => string.Join("_", DisplayNames.Select(n => n.Replace(" ", string.Empty)));
+    }
+
+    /// <summary>
+    /// Confirmed Product Code -> Product mapping. AGVQ intentionally maps to a single
+    /// bucket that carries both "Signature Credit" and "Signature Debit" as display names,
+    /// so records for both end up in the same generated .mdb.
+    /// </summary>
+    public static class ProductMapping
+    {
+        public static readonly IReadOnlyDictionary<string, ProductInfo> ByCode = Build();
+
+        private static Dictionary<string, ProductInfo> Build()
+        {
+            // (Code, DisplayName) pairs exactly as confirmed. AGVQ appears twice on purpose.
+            var raw = new (string Code, string Name)[]
+            {
+                ("AGVR", "Business Credit"),
+                ("AGVG", "Business Debit"),
+                ("AGVK", "Classic Credit"),
+                ("AGVL", "Platinum Credit"),
+                ("AGVQ", "Signature Credit"),
+                ("AGVN", "Infinite Credit"),
+                ("AGVQ", "Signature Debit"),
+                ("AGVP", "Infinite Debit"),
+                ("AGVB", "International Debit"),
+                ("AGVA", "Personal Debit"),
+                ("BBGP", "Prepaid"),
+                ("AGVC", "Prestige Debit"),
+                ("AGVE", "Premier Debit"),
+            };
+
+            var map = new Dictionary<string, ProductInfo>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (code, name) in raw)
+            {
+                if (!map.TryGetValue(code, out var info))
+                {
+                    info = new ProductInfo { Code = code };
+                    map[code] = info;
+                }
+                info.DisplayNames.Add(name);
+            }
+
+            return map;
+        }
+
+        public static bool TryGet(string code, out ProductInfo info)
+        {
+            if (string.IsNullOrEmpty(code))
+            {
+                info = null;
+                return false;
+            }
+
+            return ByCode.TryGetValue(code, out info);
+        }
+    }
+
+    /// <summary>A single successfully-parsed, product-valid card record.</summary>
+    public class CardRecord
+    {
+        public int RecordIndex { get; set; }
+        public string ProductCode { get; set; }
+        public string PAN { get; set; }
+        public string EXP { get; set; }
+        public string Name { get; set; }
+        public string CVV2 { get; set; }
+        public string Track1 { get; set; }
+        public string Track2 { get; set; }
+        public string Chip1 { get; set; }
+        public string Chip2 { get; set; }
+        public string Chip3 { get; set; }
+        public string Chip4 { get; set; }
+    }
+
+    /// <summary>A record that could not be placed into any output .mdb, with the reason why.</summary>
+    public class FailedRecord
+    {
+        public string FileName { get; set; }
+        public int RecordIndex { get; set; }
+        public string MaskedPan { get; set; }
+        public string ProductCode { get; set; }
+        public string Reason { get; set; }
+    }
+
+    /// <summary>Result of parsing one input file: valid records (ready for grouping/MDB), failed records
+    /// (destined for the Excel report), and any hard parse exceptions (kept for the existing error UI).</summary>
+    public class FileParseResult
+    {
+        public string FilePath { get; set; }
+        public List<CardRecord> Records { get; } = new();
+        public List<FailedRecord> FailedRecords { get; } = new();
+        public List<string> ParseErrors { get; } = new();
+    }
+
     public static class FileHelper
     {
-        static string lengthText;
-   
+        /// <summary>Combined chip string ("{" + 7-digit length + hex) must not exceed this, per the
+        /// confirmed hard schema limit of 4 x 255-char TEXT columns.</summary>
+        private const int MaxChipDataLength = 1020;
+
+        /// <summary>Confirmed fixed length of the Card Holder Name field.</summary>
+        private const int CardHolderNameMaxLength = 26;
+
         public static List<FileProcessingResult> GetAllFilesRecords(string folderPath)
         {
             var results = new List<FileProcessingResult>();
@@ -45,14 +161,14 @@ namespace AbsaConverterTool.Helper
                         .Split(new string[] { "#END#" }, StringSplitOptions.RemoveEmptyEntries)
                         .ToList();
 
-                  
+
                     if (result.RecordsInBytes.Count != result.RecordsInText.Count)
                     {
                         result.ErrorMessage = $"Mismatch between bytes and text count. Bytes: {result.RecordsInBytes.Count}, Text: {result.RecordsInText.Count}";
                     }
                     else
                     {
-               
+
                         if (result.RecordsInBytes.Count > 0)
                         {
                             result.RecordsInBytes.RemoveAt(0);
@@ -112,15 +228,21 @@ namespace AbsaConverterTool.Helper
 
             return records;
         }
-        private static byte[] ExtractRawChipData(byte[] recordBytes)
+
+        /// <summary>
+        /// Finds the raw chip byte block after "{" + a 7-digit length prefix.
+        /// Refactored: the 7-digit length prefix is now returned instead of being
+        /// stashed in a static field, so this method has no shared mutable state.
+        /// </summary>
+        private static (string LengthText, byte[] Data) ExtractRawChipData(byte[] recordBytes)
         {
             int braceIndex = Array.IndexOf(recordBytes, (byte)'{');
             if (braceIndex == -1 || braceIndex + 8 > recordBytes.Length)
-                return Array.Empty<byte>();
+                return (null, Array.Empty<byte>());
 
             int startIndex = braceIndex + 1;
 
-            lengthText = Encoding.ASCII.GetString(recordBytes, startIndex, 7);
+            string lengthText = Encoding.ASCII.GetString(recordBytes, startIndex, 7);
             if (!int.TryParse(lengthText, out int byteCount))
                 throw new Exception("Invalid length format in chip data");
 
@@ -132,11 +254,19 @@ namespace AbsaConverterTool.Helper
             byte[] chipData = new byte[byteCount];
             Array.Copy(recordBytes, dataStartIndex, chipData, 0, byteCount);
 
-            return chipData;
+            return (lengthText, chipData);
         }
 
-        private static string ReadBinaryChipData(byte[] binaryData)
+        /// <summary>
+        /// Rebuilds the "{" + 7-digit length + uppercase-hex string. Byte-for-byte identical
+        /// output to the original implementation; the length prefix is now passed in explicitly
+        /// instead of being read from a static field.
+        /// </summary>
+        private static string ReadBinaryChipData(string lengthText, byte[] binaryData)
         {
+            if (string.IsNullOrEmpty(lengthText))
+                return string.Empty;
+
             try
             {
                 StringBuilder stringBuilder = new StringBuilder((binaryData.Length * 2) + 8);
@@ -155,6 +285,7 @@ namespace AbsaConverterTool.Helper
                 return string.Empty;
             }
         }
+
         /// <summary>
         /// Extract fixed-length substring from text between two delimiters.
         /// If the extracted text is shorter than expected, it pads with spaces.
@@ -187,6 +318,7 @@ namespace AbsaConverterTool.Helper
 
             return result;
         }
+
         public static string ExtractLine(string text, string prefix, int length)
         {
             var index = text.IndexOf(prefix);
@@ -214,8 +346,78 @@ namespace AbsaConverterTool.Helper
             return text.Substring(start, end - start).Trim();
         }
 
+        /// <summary>
+        /// Confirmed rule: the Product Code is the 4 characters immediately following the
+        /// first ' character in the record. Uses the ' as the anchor rather than a fixed
+        /// offset, so it keeps working if the leading record counter's width changes.
+        /// </summary>
+        public static string ExtractProductCode(string record)
+        {
+            if (string.IsNullOrEmpty(record))
+                return null;
 
+            int quoteIndex = record.IndexOf('\'');
+            if (quoteIndex == -1)
+                return null;
 
+            int start = quoteIndex + 1;
+            if (start + 4 > record.Length)
+                return null;
+
+            return record.Substring(start, 4);
+        }
+
+        /// <summary>
+        /// Confirmed rule: Card Holder Name starts immediately after ')'. The field's end is
+        /// not separately specified beyond "fixed 26-character field", so — consistent with
+        /// every other delimited field in this file format — extraction stops at the next '@'
+        /// (or end of record if none exists) before trimming and applying the 26-char cap.
+        /// If this end boundary turns out to be wrong for some records, it's isolated to this
+        /// one method.
+        /// </summary>
+        public static string ExtractCardHolderName(string record)
+        {
+            if (string.IsNullOrEmpty(record))
+                return string.Empty;
+
+            int startIndex = record.IndexOf(')');
+            if (startIndex == -1)
+                return string.Empty;
+
+            startIndex += 1;
+            if (startIndex >= record.Length)
+                return string.Empty;
+
+            int endIndex = record.IndexOf('@', startIndex);
+            string raw = endIndex == -1
+                ? record.Substring(startIndex)
+                : record.Substring(startIndex, endIndex - startIndex);
+
+            string trimmed = raw.Trim();
+
+            return trimmed.Length > CardHolderNameMaxLength
+                ? trimmed.Substring(0, CardHolderNameMaxLength)
+                : trimmed;
+        }
+
+        /// <summary>
+        /// Masks a PAN to first-6 + last-4 for the failure report (never store/display the
+        /// full PAN in the report). Short/unusable values are fully masked rather than shown.
+        /// </summary>
+        public static string MaskPan(string pan)
+        {
+            if (string.IsNullOrWhiteSpace(pan))
+                return string.Empty;
+
+            string digits = pan.Trim();
+            if (digits.Length <= 10)
+                return new string('*', digits.Length);
+
+            string first6 = digits.Substring(0, 6);
+            string last4 = digits.Substring(digits.Length - 4);
+            string middleMask = new string('*', digits.Length - 10);
+            return $"{first6}{middleMask}{last4}";
+        }
 
         public static void CreateEmptyAccdb(string path)
         {
@@ -237,10 +439,11 @@ namespace AbsaConverterTool.Helper
                 }
             }
         }
+
         public static void CreateMdbFromDataTable(DataTable table, string mdbPath, string tableName = "Cards")
-    {
-        if (table == null || table.Rows.Count == 0)
-            throw new ArgumentException("DataTable is empty.");
+        {
+            if (table == null || table.Rows.Count == 0)
+                throw new ArgumentException("DataTable is empty.");
 
             string folder = Path.GetDirectoryName(mdbPath);
             if (!Directory.Exists(folder))
@@ -261,62 +464,61 @@ namespace AbsaConverterTool.Helper
             }
             string connectionString = $"Provider=Microsoft.ACE.OLEDB.12.0;Data Source={mdbPath};Persist Security Info=False;";
 
-        using (OleDbConnection conn = new OleDbConnection(connectionString))
-        {
-            conn.Open();
-
-            using (OleDbTransaction transaction = conn.BeginTransaction())
+            using (OleDbConnection conn = new OleDbConnection(connectionString))
             {
-                try
+                conn.Open();
+
+                using (OleDbTransaction transaction = conn.BeginTransaction())
                 {
-                    // Create table
-                    using (OleDbCommand cmd = new OleDbCommand(BuildCreateTableQuery(table, tableName), conn, transaction))
+                    try
                     {
-                        cmd.ExecuteNonQuery();
-                    }
-
-                    // Prepare insert command once
-                    using (OleDbCommand cmd = new OleDbCommand(BuildInsertQuery(table, tableName), conn, transaction))
-                    {
-                        foreach (DataRow row in table.Rows)
+                        // Create table
+                        using (OleDbCommand cmd = new OleDbCommand(BuildCreateTableQuery(table, tableName), conn, transaction))
                         {
-                            cmd.Parameters.Clear();
-                            for (int i = 0; i < table.Columns.Count; i++)
-                            {
-                                object value = row[i] ?? DBNull.Value;
-
-                                if (value is byte[] bytes)
-                                    cmd.Parameters.Add("?", OleDbType.Binary).Value = bytes;
-                                else
-                                    cmd.Parameters.AddWithValue("?", value);
-                            }
                             cmd.ExecuteNonQuery();
                         }
-                    }
 
-                    transaction.Commit();
-                }
-                catch
-                {
-                    transaction.Rollback();
-                    throw;
+                        // Prepare insert command once
+                        using (OleDbCommand cmd = new OleDbCommand(BuildInsertQuery(table, tableName), conn, transaction))
+                        {
+                            foreach (DataRow row in table.Rows)
+                            {
+                                cmd.Parameters.Clear();
+                                for (int i = 0; i < table.Columns.Count; i++)
+                                {
+                                    object value = row[i] ?? DBNull.Value;
+
+                                    if (value is byte[] bytes)
+                                        cmd.Parameters.Add("?", OleDbType.Binary).Value = bytes;
+                                    else
+                                        cmd.Parameters.AddWithValue("?", value);
+                                }
+                                cmd.ExecuteNonQuery();
+                            }
+                        }
+
+                        transaction.Commit();
+                    }
+                    catch
+                    {
+                        transaction.Rollback();
+                        throw;
+                    }
                 }
             }
         }
-    }
-        
-        public static (DataTable Table, List<string> Errors) ParseRecordsOfFileToDataTable(
-        List<string> records,
-        List<byte[]> recordsInBytes,
-        string filePath
-    )
+
+        /// <summary>
+        /// Builds the "Cards" DataTable (same schema as before) from an already-grouped
+        /// list of valid CardRecords for a single product bucket. IDWAutoNumber restarts
+        /// at 1 per generated .mdb, matching the original per-file numbering.
+        /// </summary>
+        public static DataTable BuildCardsDataTable(List<CardRecord> records)
         {
             var table = new DataTable("Cards");
-            var errors = new List<string>();
 
-            // الأعمدة
-            table.Columns.Add("IDWAutoNumber", typeof(int)); // Auto increment
-            table.Columns.Add("JobNumber", typeof(int));     // Constant 1
+            table.Columns.Add("IDWAutoNumber", typeof(int));
+            table.Columns.Add("JobNumber", typeof(int));
             table.Columns.Add("IDWPAN", typeof(string));
             table.Columns.Add("IDWEXP", typeof(string));
             table.Columns.Add("IDWNAME", typeof(string));
@@ -328,84 +530,213 @@ namespace AbsaConverterTool.Helper
             table.Columns.Add("IDWChip3", typeof(string));
             table.Columns.Add("IDWChip4", typeof(string));
 
+            int autoNumber = 1;
+            foreach (var r in records)
+            {
+                table.Rows.Add(
+                    autoNumber++,
+                    1,
+                    r.PAN,
+                    r.EXP,
+                    r.Name,
+                    r.CVV2,
+                    r.Track1,
+                    r.Track2,
+                    r.Chip1,
+                    r.Chip2,
+                    r.Chip3,
+                    r.Chip4
+                );
+            }
+
+            return table;
+        }
+
+        /// <summary>
+        /// Parses every record of one input file into valid CardRecords (product-known,
+        /// chip within the 1020-char limit) and FailedRecords (missing/unknown product code,
+        /// oversized chip data, or a parse exception). Never throws for a single bad record —
+        /// the record is captured as a FailedRecord instead so the rest of the file continues.
+        /// </summary>
+        public static FileParseResult ParseFileRecords(List<string> records, List<byte[]> recordsInBytes, string filePath)
+        {
+            var result = new FileParseResult { FilePath = filePath };
+            string fileName = Path.GetFileName(filePath);
+
             for (int i = 0; i < records.Count; i++)
             {
+                int recordIndex = i + 1; // 1-based, matches previous IDWAutoNumber numbering
+                string rawRecord = records[i];
+                string productCode = null;
+                string maskedPan = string.Empty;
+
                 try
                 {
-                    string IDWPAN = ExtractBetween(records[i], "*", "@");
-                    string IDWEXP = ExtractBetweenWithFixedLength(records[i], '$', '@', 13, 5);
-                    string IDWNAME = ExtractBetween(records[i], ") ", "@");
-                    string IDWCVV2 = ExtractBetween(records[i], ":", "@");
-                    string track1AndTrack2 = ExtractBetween(records[i], "\"", "@");
+                    productCode = ExtractProductCode(rawRecord);
+
+                    string IDWPAN = ExtractBetween(rawRecord, "*", "@");
+                    maskedPan = MaskPan(IDWPAN);
+
+                    if (string.IsNullOrEmpty(productCode))
+                    {
+                        result.FailedRecords.Add(new FailedRecord
+                        {
+                            FileName = fileName,
+                            RecordIndex = recordIndex,
+                            MaskedPan = maskedPan,
+                            ProductCode = string.Empty,
+                            Reason = "missing product code"
+                        });
+                        continue;
+                    }
+
+                    if (!ProductMapping.TryGet(productCode, out var productInfo))
+                    {
+                        result.FailedRecords.Add(new FailedRecord
+                        {
+                            FileName = fileName,
+                            RecordIndex = recordIndex,
+                            MaskedPan = maskedPan,
+                            ProductCode = productCode,
+                            Reason = $"unrecognized product code: {productCode}"
+                        });
+                        continue;
+                    }
+
+                    string IDWEXP = ExtractBetweenWithFixedLength(rawRecord, '$', '@', 13, 5);
+                    string IDWNAME = ExtractCardHolderName(rawRecord);
+                    string IDWCVV2 = ExtractBetween(rawRecord, ":", "@");
+                    string track1AndTrack2 = ExtractBetween(rawRecord, "\"", "@");
                     string IDWTrack1 = ExtractBetween(track1AndTrack2, "%", "?");
                     string IDWTrack2 = ExtractBetween(track1AndTrack2, ";", "?");
 
-                    // قراءة البيانات الثنائية
-                    string chipData = ReadBinaryChipData(ExtractRawChipData(recordsInBytes[i]));
+                    var (lengthText, rawChip) = ExtractRawChipData(recordsInBytes[i]);
+                    string chipData = ReadBinaryChipData(lengthText, rawChip);
 
-                    // قسمها على 4 أعمدة
+                    if (chipData.Length > MaxChipDataLength)
+                    {
+                        result.FailedRecords.Add(new FailedRecord
+                        {
+                            FileName = fileName,
+                            RecordIndex = recordIndex,
+                            MaskedPan = maskedPan,
+                            ProductCode = productCode,
+                            Reason = "chip data exceeds 1020-char schema limit"
+                        });
+                        continue;
+                    }
+
                     int chunkSize = (int)Math.Ceiling(chipData.Length / 4.0);
                     string IDWchip1 = chipData.Length >= 1 ? chipData.Substring(0, Math.Min(chunkSize, chipData.Length)) : null;
                     string IDWchip2 = chipData.Length > chunkSize ? chipData.Substring(chunkSize, Math.Min(chunkSize, chipData.Length - chunkSize)) : null;
                     string IDWchip3 = chipData.Length > chunkSize * 2 ? chipData.Substring(chunkSize * 2, Math.Min(chunkSize, chipData.Length - chunkSize * 2)) : null;
                     string IDWchip4 = chipData.Length > chunkSize * 3 ? chipData.Substring(chunkSize * 3, Math.Min(chunkSize, chipData.Length - chunkSize * 3)) : null;
 
-                    table.Rows.Add(
-                        i + 1,       // IDWAutoNumber
-                        1,           // JobNumber
-                        IDWPAN,
-                        IDWEXP,
-                        IDWNAME,
-                        IDWCVV2,
-                        IDWTrack1,
-                        IDWTrack2,
-                        IDWchip1,
-                        IDWchip2,
-                        IDWchip3,
-                       IDWchip4
-                    );
+                    result.Records.Add(new CardRecord
+                    {
+                        RecordIndex = recordIndex,
+                        ProductCode = productCode,
+                        PAN = IDWPAN,
+                        EXP = IDWEXP,
+                        Name = IDWNAME,
+                        CVV2 = IDWCVV2,
+                        Track1 = IDWTrack1,
+                        Track2 = IDWTrack2,
+                        Chip1 = IDWchip1,
+                        Chip2 = IDWchip2,
+                        Chip3 = IDWchip3,
+                        Chip4 = IDWchip4
+                    });
                 }
                 catch (Exception ex)
                 {
-                    errors.Add($"File: {filePath}, Record Index: {i}, Error: {ex.Message}");
+                    result.ParseErrors.Add($"File: {filePath}, Record Index: {i}, Error: {ex.Message}");
+                    result.FailedRecords.Add(new FailedRecord
+                    {
+                        FileName = fileName,
+                        RecordIndex = recordIndex,
+                        MaskedPan = maskedPan,
+                        ProductCode = productCode ?? string.Empty,
+                        Reason = $"parse error: {ex.Message}"
+                    });
                 }
             }
 
-            return (table, errors);
+            return result;
         }
+
+        /// <summary>
+        /// Writes the confirmed Failures.xlsx report: Masked PAN, File Name, Record Index,
+        /// Product Code, Reason. Only ever called when at least one FailedRecord exists.
+        /// </summary>
+        public static void WriteFailuresReport(List<FailedRecord> failedRecords, string outputPath)
+        {
+            string folder = Path.GetDirectoryName(outputPath);
+            if (!string.IsNullOrEmpty(folder) && !Directory.Exists(folder))
+                Directory.CreateDirectory(folder);
+
+            using var workbook = new XLWorkbook();
+            var sheet = workbook.Worksheets.Add("Failures");
+
+            sheet.Cell(1, 1).Value = "Masked PAN";
+            sheet.Cell(1, 2).Value = "File Name";
+            sheet.Cell(1, 3).Value = "Record Index";
+            sheet.Cell(1, 4).Value = "Product Code";
+            sheet.Cell(1, 5).Value = "Reason";
+            sheet.Row(1).Style.Font.Bold = true;
+
+            int row = 2;
+            foreach (var failure in failedRecords)
+            {
+                sheet.Cell(row, 1).Value = failure.MaskedPan;
+                sheet.Cell(row, 2).Value = failure.FileName;
+                sheet.Cell(row, 3).Value = failure.RecordIndex;
+                sheet.Cell(row, 4).Value = failure.ProductCode;
+                sheet.Cell(row, 5).Value = failure.Reason;
+                row++;
+            }
+
+            sheet.Columns().AdjustToContents();
+            workbook.SaveAs(outputPath);
+        }
+
         private static string BuildCreateTableQuery(DataTable table, string tableName)
-    {
-        string query = $"CREATE TABLE [{tableName}] (";
-
-        foreach (DataColumn col in table.Columns)
         {
-            query += $"[{col.ColumnName}] {MapType(col.DataType)},";
+            string query = $"CREATE TABLE [{tableName}] (";
+
+            foreach (DataColumn col in table.Columns)
+            {
+                query += $"[{col.ColumnName}] {MapType(col.DataType)},";
+            }
+
+            query = query.TrimEnd(',') + ")";
+            return query;
         }
 
-        query = query.TrimEnd(',') + ")";
-        return query;
-    }
-
-    private static string BuildInsertQuery(DataTable table, string tableName)
-    {
-        string columns = "";
-        string values = "";
-
-        foreach (DataColumn col in table.Columns)
+        private static string BuildInsertQuery(DataTable table, string tableName)
         {
-            columns += $"[{col.ColumnName}],";
-            values += "?,";
+            string columns = "";
+            string values = "";
+
+            foreach (DataColumn col in table.Columns)
+            {
+                columns += $"[{col.ColumnName}],";
+                values += "?,";
+            }
+
+            columns = columns.TrimEnd(',');
+            values = values.TrimEnd(',');
+
+            return $"INSERT INTO [{tableName}] ({columns}) VALUES ({values})";
         }
 
-        columns = columns.TrimEnd(',');
-        values = values.TrimEnd(',');
-
-        return $"INSERT INTO [{tableName}] ({columns}) VALUES ({values})";
-    }
-
+        // NOTE: chip columns are deliberately kept as Access TEXT (255-char cap x 4 = 1020
+        // total) — confirmed as an intentional, load-bearing schema constraint for a
+        // downstream personalization system. Do not change this to MEMO/Long Text; instead
+        // the 1020-char guard in ParseFileRecords fails a record before it ever reaches here.
         private static string MapType(Type type, string columnName = "")
         {
-           
+
             if (columnName.StartsWith("Chip")) return "MEMO";
 
             if (type == typeof(string)) return "TEXT";
