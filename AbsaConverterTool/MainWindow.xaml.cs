@@ -153,10 +153,9 @@ public partial class MainWindow : Window
                     sb.Append($"IDWCVV2: {record.CVV2} | ");
                     sb.Append($"IDWTrack1: {record.Track1} | ");
                     sb.Append($"IDWTrack2: {record.Track2} | ");
-                    sb.Append($"IDWChip1: {record.Chip1} | ");
-                    sb.Append($"IDWChip2: {record.Chip2} | ");
-                    sb.Append($"IDWChip3: {record.Chip3} | ");
-                    sb.Append($"IDWChip4: {record.Chip4} | ");
+                    int chipLength = record.ChipData?.Length ?? 0;
+                    int chipColumns = Math.Max(4, (int)Math.Ceiling(chipLength / 255.0));
+                    sb.Append($"ChipData: {chipLength} char(s) -> {chipColumns} column(s) | ");
                     sb.AppendLine("********************************************************");
                     LogTextBox.AppendText(sb.ToString() + Environment.NewLine);
                 }

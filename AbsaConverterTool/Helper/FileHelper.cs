@@ -1,6 +1,7 @@
 ﻿using System.Data;
 using System.Data.OleDb;
 using System.IO;
+using System.Linq;
 using ADOX;
 using ClosedXML.Excel;
 
@@ -17,26 +18,31 @@ namespace AbsaConverterTool.Helper
     }
 
     /// <summary>
-    /// One product entry from the confirmed mapping table. AGVQ is shared by
-    /// "Signature Credit" and "Signature Debit", so a single ProductInfo can carry
-    /// more than one display name while still resolving to one output bucket.
+    /// One product entry from the confirmed mapping table. The mapping is keyed by
+    /// code and grouped generically: if two product names ever share a code, one
+    /// ProductInfo carries both display names and both resolve to one output bucket.
+    /// As of the latest mapping, Signature Credit (AGVO) and Signature Debit (AGVQ)
+    /// have distinct codes and are no longer combined — this is not special-cased
+    /// anywhere; it falls out of the code-keyed grouping automatically.
     /// </summary>
     public class ProductInfo
     {
         public string Code { get; set; }
         public List<string> DisplayNames { get; } = new();
 
-        /// <summary>Human-readable name(s) for UI/log display, e.g. "Signature Credit + Signature Debit".</summary>
+        /// <summary>Human-readable name(s) for UI/log display, e.g. "Signature Credit + Signature Debit"
+        /// if a code is ever shared again, or just "Signature Credit" for a single-name bucket.</summary>
         public string DisplayName => string.Join(" + ", DisplayNames);
 
-        /// <summary>Token used inside generated file names, e.g. "SignatureCredit_SignatureDebit".</summary>
+        /// <summary>Token used inside generated file names, e.g. "SignatureCredit" or, for a shared code,
+        /// "SignatureCredit_SignatureDebit".</summary>
         public string FileNameToken => string.Join("_", DisplayNames.Select(n => n.Replace(" ", string.Empty)));
     }
 
     /// <summary>
-    /// Confirmed Product Code -> Product mapping. AGVQ intentionally maps to a single
-    /// bucket that carries both "Signature Credit" and "Signature Debit" as display names,
-    /// so records for both end up in the same generated .mdb.
+    /// Confirmed Product Code -> Product mapping. Grouping by code is generic: it only
+    /// combines two product names into one bucket if they actually share a code. Update
+    /// this table and the grouping/naming keep working without further code changes.
     /// </summary>
     public static class ProductMapping
     {
@@ -44,14 +50,15 @@ namespace AbsaConverterTool.Helper
 
         private static Dictionary<string, ProductInfo> Build()
         {
-            // (Code, DisplayName) pairs exactly as confirmed. AGVQ appears twice on purpose.
+            // (Code, DisplayName) pairs exactly as confirmed. Signature Credit = AGVO,
+            // Signature Debit = AGVQ — distinct codes, so they land in separate .mdb files.
             var raw = new (string Code, string Name)[]
             {
                 ("AGVR", "Business Credit"),
                 ("AGVG", "Business Debit"),
                 ("AGVK", "Classic Credit"),
                 ("AGVL", "Platinum Credit"),
-                ("AGVQ", "Signature Credit"),
+                ("AGVO", "Signature Credit"),
                 ("AGVN", "Infinite Credit"),
                 ("AGVQ", "Signature Debit"),
                 ("AGVP", "Infinite Debit"),
@@ -99,10 +106,11 @@ namespace AbsaConverterTool.Helper
         public string CVV2 { get; set; }
         public string Track1 { get; set; }
         public string Track2 { get; set; }
-        public string Chip1 { get; set; }
-        public string Chip2 { get; set; }
-        public string Chip3 { get; set; }
-        public string Chip4 { get; set; }
+
+        /// <summary>The full combined chip string ("{" + 7-digit length + uppercase hex), not yet
+        /// split into IDWChip# columns. Splitting happens in BuildCardsDataTable, once the number
+        /// of chip columns needed for the whole output file is known.</summary>
+        public string ChipData { get; set; }
     }
 
     /// <summary>A record that could not be placed into any output .mdb, with the reason why.</summary>
@@ -127,9 +135,13 @@ namespace AbsaConverterTool.Helper
 
     public static class FileHelper
     {
-        /// <summary>Combined chip string ("{" + 7-digit length + hex) must not exceed this, per the
-        /// confirmed hard schema limit of 4 x 255-char TEXT columns.</summary>
-        private const int MaxChipDataLength = 1020;
+        /// <summary>Capacity of a single IDWChip# TEXT column. The combined chip string is split
+        /// into sequential chunks of this size; as many IDWChip# columns are created as needed
+        /// (minimum 4, matching the original fixed schema) so chip data is never truncated.</summary>
+        private const int ChipColumnSize = 255;
+
+        /// <summary>Minimum number of IDWChip# columns always present, matching the original schema.</summary>
+        private const int MinChipColumns = 4;
 
         /// <summary>Confirmed fixed length of the Card Holder Name field.</summary>
         private const int CardHolderNameMaxLength = 26;
@@ -509,9 +521,16 @@ namespace AbsaConverterTool.Helper
         }
 
         /// <summary>
-        /// Builds the "Cards" DataTable (same schema as before) from an already-grouped
-        /// list of valid CardRecords for a single product bucket. IDWAutoNumber restarts
-        /// at 1 per generated .mdb, matching the original per-file numbering.
+        /// Builds the "Cards" DataTable from an already-grouped list of valid CardRecords for
+        /// a single product bucket. IDWAutoNumber restarts at 1 per generated .mdb, matching the
+        /// original per-file numbering.
+        ///
+        /// Chip columns are dynamic: this file's table always has at least IDWChip1..IDWChip4
+        /// (matching the original fixed schema), and gains IDWChip5, IDWChip6, ... only if some
+        /// record's combined chip string is longer than 4 x 255 = 1020 characters. Every record
+        /// in this table shares the same column count — it's sized once, up front, to the widest
+        /// chip data in the group — so a single long outlier widens the whole output file, not
+        /// just its own row. No chip data is ever truncated or dropped.
         /// </summary>
         public static DataTable BuildCardsDataTable(List<CardRecord> records)
         {
@@ -525,38 +544,69 @@ namespace AbsaConverterTool.Helper
             table.Columns.Add("IDWCVV2", typeof(string));
             table.Columns.Add("IDWTrack1", typeof(string));
             table.Columns.Add("IDWTrack2", typeof(string));
-            table.Columns.Add("IDWChip1", typeof(string));
-            table.Columns.Add("IDWChip2", typeof(string));
-            table.Columns.Add("IDWChip3", typeof(string));
-            table.Columns.Add("IDWChip4", typeof(string));
+
+            int maxChipLength = records.Count > 0 ? records.Max(r => r.ChipData?.Length ?? 0) : 0;
+            int chipColumnCount = Math.Max(MinChipColumns, (int)Math.Ceiling(maxChipLength / (double)ChipColumnSize));
+
+            for (int c = 1; c <= chipColumnCount; c++)
+                table.Columns.Add($"IDWChip{c}", typeof(string));
 
             int autoNumber = 1;
             foreach (var r in records)
             {
-                table.Rows.Add(
-                    autoNumber++,
-                    1,
-                    r.PAN,
-                    r.EXP,
-                    r.Name,
-                    r.CVV2,
-                    r.Track1,
-                    r.Track2,
-                    r.Chip1,
-                    r.Chip2,
-                    r.Chip3,
-                    r.Chip4
-                );
+                var row = table.NewRow();
+                row["IDWAutoNumber"] = autoNumber++;
+                row["JobNumber"] = 1;
+                row["IDWPAN"] = (object)r.PAN ?? DBNull.Value;
+                row["IDWEXP"] = (object)r.EXP ?? DBNull.Value;
+                row["IDWNAME"] = (object)r.Name ?? DBNull.Value;
+                row["IDWCVV2"] = (object)r.CVV2 ?? DBNull.Value;
+                row["IDWTrack1"] = (object)r.Track1 ?? DBNull.Value;
+                row["IDWTrack2"] = (object)r.Track2 ?? DBNull.Value;
+
+                var chunks = SplitChipData(r.ChipData, ChipColumnSize);
+                for (int c = 1; c <= chipColumnCount; c++)
+                {
+                    row[$"IDWChip{c}"] = c <= chunks.Count ? (object)chunks[c - 1] : DBNull.Value;
+                }
+
+                table.Rows.Add(row);
             }
 
             return table;
         }
 
         /// <summary>
-        /// Parses every record of one input file into valid CardRecords (product-known,
-        /// chip within the 1020-char limit) and FailedRecords (missing/unknown product code,
-        /// oversized chip data, or a parse exception). Never throws for a single bad record —
-        /// the record is captured as a FailedRecord instead so the rest of the file continues.
+        /// Splits the combined chip string ("{" + 7-digit length + hex) into sequential,
+        /// fixed-size chunks of up to <paramref name="chunkSize"/> characters each — e.g. for
+        /// a 1040-char string and chunkSize 255: four 255-char chunks (1020 chars) plus one
+        /// final 20-char chunk. This replaces the original proportional 4-way split
+        /// (chunkSize = ceil(total/4)); the trade-off is an intentional one, confirmed alongside
+        /// the move to dynamic columns: with a fixed 255-char chunk, a record's chip data can
+        /// leave later baseline columns (IDWChip2-4) null even when the total is under 1020,
+        /// instead of spreading it evenly across all 4 as before. No data is ever lost.
+        /// </summary>
+        private static List<string> SplitChipData(string chipData, int chunkSize)
+        {
+            var chunks = new List<string>();
+            if (string.IsNullOrEmpty(chipData))
+                return chunks;
+
+            for (int offset = 0; offset < chipData.Length; offset += chunkSize)
+            {
+                int length = Math.Min(chunkSize, chipData.Length - offset);
+                chunks.Add(chipData.Substring(offset, length));
+            }
+
+            return chunks;
+        }
+
+        /// <summary>
+        /// Parses every record of one input file into valid CardRecords (product-known) and
+        /// FailedRecords (missing/unknown product code, or a parse exception). Chip data is never
+        /// a failure reason — its column count grows dynamically instead, see BuildCardsDataTable.
+        /// Never throws for a single bad record — the record is captured as a FailedRecord instead
+        /// so the rest of the file continues.
         /// </summary>
         public static FileParseResult ParseFileRecords(List<string> records, List<byte[]> recordsInBytes, string filePath)
         {
@@ -610,27 +660,14 @@ namespace AbsaConverterTool.Helper
                     string IDWTrack1 = ExtractBetween(track1AndTrack2, "%", "?");
                     string IDWTrack2 = ExtractBetween(track1AndTrack2, ";", "?");
 
+                    // No length ceiling here by design: ExtractRawChipData already validates the
+                    // declared length against the record's own byte length (throws "Chip data
+                    // length exceeds record size" for a corrupted/garbage prefix), so chipData
+                    // can never exceed the record it came from. Splitting into as many IDWChip#
+                    // columns as needed happens later, in BuildCardsDataTable, once every
+                    // record's chip length in this product group is known.
                     var (lengthText, rawChip) = ExtractRawChipData(recordsInBytes[i]);
                     string chipData = ReadBinaryChipData(lengthText, rawChip);
-
-                    if (chipData.Length > MaxChipDataLength)
-                    {
-                        result.FailedRecords.Add(new FailedRecord
-                        {
-                            FileName = fileName,
-                            RecordIndex = recordIndex,
-                            MaskedPan = maskedPan,
-                            ProductCode = productCode,
-                            Reason = "chip data exceeds 1020-char schema limit"
-                        });
-                        continue;
-                    }
-
-                    int chunkSize = (int)Math.Ceiling(chipData.Length / 4.0);
-                    string IDWchip1 = chipData.Length >= 1 ? chipData.Substring(0, Math.Min(chunkSize, chipData.Length)) : null;
-                    string IDWchip2 = chipData.Length > chunkSize ? chipData.Substring(chunkSize, Math.Min(chunkSize, chipData.Length - chunkSize)) : null;
-                    string IDWchip3 = chipData.Length > chunkSize * 2 ? chipData.Substring(chunkSize * 2, Math.Min(chunkSize, chipData.Length - chunkSize * 2)) : null;
-                    string IDWchip4 = chipData.Length > chunkSize * 3 ? chipData.Substring(chunkSize * 3, Math.Min(chunkSize, chipData.Length - chunkSize * 3)) : null;
 
                     result.Records.Add(new CardRecord
                     {
@@ -642,10 +679,7 @@ namespace AbsaConverterTool.Helper
                         CVV2 = IDWCVV2,
                         Track1 = IDWTrack1,
                         Track2 = IDWTrack2,
-                        Chip1 = IDWchip1,
-                        Chip2 = IDWchip2,
-                        Chip3 = IDWchip3,
-                        Chip4 = IDWchip4
+                        ChipData = chipData
                     });
                 }
                 catch (Exception ex)
@@ -730,10 +764,12 @@ namespace AbsaConverterTool.Helper
             return $"INSERT INTO [{tableName}] ({columns}) VALUES ({values})";
         }
 
-        // NOTE: chip columns are deliberately kept as Access TEXT (255-char cap x 4 = 1020
-        // total) — confirmed as an intentional, load-bearing schema constraint for a
-        // downstream personalization system. Do not change this to MEMO/Long Text; instead
-        // the 1020-char guard in ParseFileRecords fails a record before it ever reaches here.
+        // NOTE: chip columns are deliberately kept as Access TEXT (255-char cap each) —
+        // confirmed as an intentional, load-bearing pattern for a downstream personalization
+        // system. Do not change this to MEMO/Long Text. There is no longer a hard total-length
+        // limit: BuildCardsDataTable adds as many IDWChip# TEXT columns as the widest chip
+        // string in the group needs, so every column individually still respects the 255-char
+        // cap while the total capacity grows with the data.
         private static string MapType(Type type, string columnName = "")
         {
 

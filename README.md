@@ -4,7 +4,7 @@ A Windows desktop utility that converts proprietary card-data (`.inp`) files int
 
 ## Overview
 
-The tool reads every file in a chosen folder, splits each one into individual card records, and for each record extracts the Product Code, PAN, expiry date, cardholder name, CVV2, track 1/2 data, and EMV chip data. Records are grouped by product and written into per-product `Cards` tables. Records that cannot be assigned to a known product, or whose chip data is too large for the schema, are **not** written to any `.mdb` — they are collected and reported in a `Failures.xlsx` file instead. Processing never stops because of one bad file or record.
+The tool reads every file in a chosen folder, splits each one into individual card records, and for each record extracts the Product Code, PAN, expiry date, cardholder name, CVV2, track 1/2 data, and EMV chip data. Records are grouped by product and written into per-product `Cards` tables. Records that cannot be assigned to a known product are **not** written to any `.mdb` — they are collected and reported in a `Failures.xlsx` file instead. Chip data of any length is always stored in full (see "Chip data columns" below); it is never a reason a record fails. Processing never stops because of one bad file or record.
 
 ## Features
 
@@ -59,7 +59,7 @@ Input files contain one or more records separated by an `#END#` delimiter. The f
 | Card Holder Name | Text starting immediately after `)` (up to the next `@`, or end of record), trimmed, capped at **26 characters** |
 | CVV2 | Text between `:` and `@` |
 | Track 1 / Track 2 | Text between `"`/`@`, then split on `%`/`?` and `;`/`?` |
-| Chip data (`IDWChip1`–`IDWChip4`) | Binary block following `{` + a 7-digit length prefix, decoded to hex and split sequentially into 4 chunks |
+| Chip data (`IDWChip1`, `IDWChip2`, ...) | Binary block following `{` + a 7-digit length prefix, decoded to hex and split sequentially into fixed 255-character chunks, one per column — see "Chip data columns" below |
 
 ### Product mapping
 
@@ -69,7 +69,7 @@ Input files contain one or more records separated by an `#END#` delimiter. The f
 | Business Debit | `AGVG` |
 | Classic Credit | `AGVK` |
 | Platinum Credit | `AGVL` |
-| Signature Credit | `AGVQ` |
+| Signature Credit | `AGVO` |
 | Infinite Credit | `AGVN` |
 | Signature Debit | `AGVQ` |
 | Infinite Debit | `AGVP` |
@@ -79,7 +79,7 @@ Input files contain one or more records separated by an `#END#` delimiter. The f
 | Prestige Debit | `AGVC` |
 | Premier Debit | `AGVE` |
 
-**`AGVQ` is shared** by Signature Credit and Signature Debit. Records for both go into **one** output `.mdb` (they are never split into two files because they share a code), and that file's result line displays both product names: `Signature Credit + Signature Debit`.
+Signature Credit (`AGVO`) and Signature Debit (`AGVQ`) currently have **distinct codes**, so each produces its own separate output `.mdb`. The mapping/grouping is generic, not hard-coded to these two products: if a future product-code update ever has two names share one code again, they will automatically land in a single output `.mdb`, and that file's result line will display both product names joined with `+` (e.g. `Signature Credit + Signature Debit`) — no code change is required for that to happen.
 
 A record whose Product Code is **missing** or **not in this table** is not written to any `.mdb`. It is recorded in `Failures.xlsx` with reason `missing product code` or `unrecognized product code: <code>`, and processing continues with the rest of the batch.
 
@@ -89,13 +89,21 @@ A record whose Product Code is **missing** or **not in this table** is not writt
 <InputFileName>_<ProductName>.mdb
 ```
 
-`ProductName` has spaces removed (e.g. `BusinessCredit`); for the shared `AGVQ` bucket the token is `SignatureCredit_SignatureDebit`. If a name collision occurs (e.g. two input files with the same base name and the same product), a numeric suffix is appended (`..._2.mdb`, `..._3.mdb`, ...), same de-duplication behavior as v2.
+`ProductName` has spaces removed (e.g. `BusinessCredit`). If a name collision occurs (e.g. two input files with the same base name and the same product), a numeric suffix is appended (`..._2.mdb`, `..._3.mdb`, ...), same de-duplication behavior as v2. (If two product names ever again share one code, the token for that shared bucket is the two names joined with `_`, e.g. `SignatureCredit_SignatureDebit`.)
 
 ### Output schema
 
-Each generated `.mdb` file contains a single `Cards` table with the columns: `IDWAutoNumber`, `JobNumber`, `IDWPAN`, `IDWEXP`, `IDWNAME`, `IDWCVV2`, `IDWTrack1`, `IDWTrack2`, `IDWChip1`, `IDWChip2`, `IDWChip3`, `IDWChip4`. `IDWAutoNumber` restarts at 1 within each generated file, same as v2's per-file numbering.
+Each generated `.mdb` file contains a single `Cards` table with the columns: `IDWAutoNumber`, `JobNumber`, `IDWPAN`, `IDWEXP`, `IDWNAME`, `IDWCVV2`, `IDWTrack1`, `IDWTrack2`, followed by one or more `IDWChip#` columns (see below). `IDWAutoNumber` restarts at 1 within each generated file, same as v2's per-file numbering.
 
-**Chip columns are intentionally `TEXT` (255 characters each), unchanged from v2.** This is a required, load-bearing schema constraint for a downstream personalization system and is not a bug. The combined chip string (`{` + 7-digit length + hex) therefore has a hard limit of **1020 characters** (4 × 255). A record whose chip data would exceed 1020 characters is **not truncated and not inserted** — it is failed with reason `chip data exceeds 1020-char schema limit` and reported in `Failures.xlsx`.
+### Chip data columns
+
+**Chip columns are intentionally `TEXT` (255 characters each)** — a required, load-bearing pattern for a downstream personalization system, and not a bug. As of v3, the **number of chip columns is dynamic** rather than fixed at 4:
+
+- The combined chip string (`{` + 7-digit length + hex) is split into sequential, fixed-size **255-character chunks**: `IDWChip1` gets the first 255 characters, `IDWChip2` the next 255, and so on. The final populated column holds whatever remains (which may be under 255 characters).
+- Every generated `.mdb` always has **at least `IDWChip1`–`IDWChip4`**, matching the original schema, even if the data for every record in that file is short enough to fit in fewer.
+- If any record in a product group needs more than 4 columns (i.e. its chip string is longer than 1,020 characters), the table for that output file gains `IDWChip5`, `IDWChip6`, etc. — as many as the longest chip string in that group requires. All records written to that same `.mdb` share the same column count, so a single long outlier widens the whole file, not just its own row; shorter records simply leave the extra columns blank (`NULL`).
+- **No chip data is ever truncated, dropped, or causes a record to fail.** The old hard 1,020-character limit and its `chip data exceeds 1020-char schema limit` failure reason have been removed.
+- Because chunking is now a fixed 255 characters per column (rather than the four-way proportional split used before v3), a record's data distribution across `IDWChip1`–`IDWChip4` may differ from earlier versions even when the total is well under 1,020 characters — the important part is that no data is ever lost, and concatenating the populated `IDWChip#` columns in order reconstructs the exact original chip string.
 
 ### `Failures.xlsx`
 
@@ -107,7 +115,7 @@ Generated in the selected folder whenever at least one record across the batch f
 | File Name | The input file the record came from |
 | Record Index | 1-based position of the record within its input file (matches the old `IDWAutoNumber` numbering) |
 | Product Code | The extracted code, or blank if none could be extracted |
-| Reason | `missing product code`, `unrecognized product code: <code>`, `chip data exceeds 1020-char schema limit`, or `parse error: <message>` |
+| Reason | `missing product code`, `unrecognized product code: <code>`, or `parse error: <message>` |
 
 The full PAN, CVV2, track data, and chip data are never written to this report.
 
@@ -124,4 +132,4 @@ AbsaConverterTool/
 
 - The input folder scan reads *every* file in the folder (no extension filter). Re-running **Choose Folder** on a folder that already contains previously generated `*_Output.mdb`/`Failures.xlsx` files will attempt to parse those too; a non-card file typically fails as a parse error (shown in the file-level error list) and does not affect the rest of the batch.
 - Card Holder Name extraction assumes the name field ends at the next `@` character after the opening `)` (consistent with how every other field in this format is delimited). If a particular file's layout doesn't follow that convention, the extracted name may need review.
-- Chip data over 1020 combined characters is a hard failure (by design — see above), not a truncation.
+- Chip data has no length ceiling and can never cause a record to fail; the output `.mdb` gains extra `IDWChip#` columns as needed (see "Chip data columns" above). A single very long chip record in a batch widens every generated file for that product group, not just its own row.
